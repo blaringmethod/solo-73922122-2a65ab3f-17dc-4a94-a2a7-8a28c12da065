@@ -15,7 +15,9 @@ import pytest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 HARNESS = os.path.join(ROOT, "scripts", "worker_harness.py")
-DSN = open("/tmp/pg_dsn.txt").read().strip()
+# conftest.py provisions a dedicated throw-away cluster for the suite; reuse
+# its DSN so the subprocess harness talks to the same database.
+DSN = os.environ.get("DATABASE_DSN") or open("/tmp/pg_dsn.txt").read().strip()
 BASE_ENV = {
     **os.environ,
     "DATABASE_DSN": DSN,

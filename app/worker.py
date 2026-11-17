@@ -278,7 +278,8 @@ class DecisionWorker:
                 """
                 UPDATE batches
                    SET status=$2, median_nm=$3, ref_mean_nm=$4, deviation_nm=$5,
-                       reference_ids=$6::jsonb, decided_at=now(), decided_by=$7
+                       reference_ids=$6::jsonb, decided_at=clock_timestamp(),
+                       decided_by=$7
                  WHERE id=$1
                 """,
                 batch_id, status, med, ref_mean, deviation,

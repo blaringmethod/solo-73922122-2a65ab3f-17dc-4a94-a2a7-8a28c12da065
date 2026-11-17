@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import asyncpg
 
 from .csvutil import ParsedCsv
+from .cursor import ReleaseCursor, decode_cursor
 from .storage import StoredArtifact
 
 # Unique constraint backing per-device accept_seq (see schema.py).  Concurrent
@@ -209,12 +210,50 @@ async def list_device_batches(pool: asyncpg.pool.Pool,
         ]
 
 
+@dataclass
+class ReleasedPage:
+    """One page of the released-batch read model plus continuation state."""
+
+    total: int
+    items: List[Dict[str, Any]]
+    next_cursor: Optional[str]
+    has_more: bool
+
+
 async def get_released_data(pool: asyncpg.pool.Pool, *,
                             device_id: Optional[str],
                             batch_no: Optional[str],
                             limit: int,
-                            offset: int) -> Tuple[int, List[Dict[str, Any]]]:
-    """Read model for the data lake: *only* released batches are served."""
+                            offset: Optional[int] = None,
+                            cursor: Optional[str] = None) -> ReleasedPage:
+    """Read model for the data lake: *only* released batches are served.
+
+    Two pagination modes share the same filters and page size:
+
+    * **cursor mode** (preferred for continuous ingestion): pass the opaque
+      ``cursor`` returned by a previous call.  Rows are read by keyset over
+      the immutable release position ``(decided_at, id)``, so batches that are
+      released late (an early-accepted batch stuck behind a slow head batch)
+      are still reached and no row is ever repeated or skipped.  An empty page
+      simply returns the same cursor; polling it later surfaces newly released
+      batches.  The cursor is fully durable (it encodes only row values), so it
+      survives API instance restarts.
+    * **offset mode** (legacy, single-page snapshot queries): when no cursor
+      is given, ``offset`` is applied exactly as before.
+
+    In both modes every page is ordered by release order ``(decided_at, id)``.
+    """
+    if cursor is not None:
+        return await _get_released_cursor_page(
+            pool, device_id=device_id, batch_no=batch_no,
+            limit=limit, cursor_token=cursor)
+    return await _get_released_offset_page(
+        pool, device_id=device_id, batch_no=batch_no,
+        limit=limit, offset=offset or 0)
+
+
+def _released_filters(device_id: Optional[str],
+                      batch_no: Optional[str]) -> Tuple[List[str], List[Any]]:
     where = ["status = 'RELEASED'"]
     params: List[Any] = []
     if device_id:
@@ -223,6 +262,31 @@ async def get_released_data(pool: asyncpg.pool.Pool, *,
     if batch_no:
         params.append(batch_no)
         where.append(f"batch_no = ${len(params)}")
+    return where, params
+
+
+async def _serialize_batch(conn: asyncpg.Connection,
+                           r: asyncpg.Record) -> Dict[str, Any]:
+    wafers = await conn.fetch(
+        "SELECT wafer_no, thickness_nm FROM wafer_measurements "
+        "WHERE batch_id=$1 ORDER BY wafer_no", r["id"])
+    return {
+        "batch_no": r["batch_no"],
+        "device_id": r["device_id"],
+        "accept_seq": r["accept_seq"],
+        "median_nm": r["median_nm"],
+        "decided_at": r["decided_at"].isoformat() if r["decided_at"] else None,
+        "wafers": [
+            {"wafer_no": w["wafer_no"], "thickness_nm": w["thickness_nm"]}
+            for w in wafers
+        ],
+    }
+
+
+async def _get_released_offset_page(pool, *, device_id, batch_no,
+                                    limit, offset) -> ReleasedPage:
+    """Legacy OFFSET pagination: a stable snapshot within one query."""
+    where, params = _released_filters(device_id, batch_no)
     where_sql = " WHERE " + " AND ".join(where)
 
     async with pool.acquire() as conn:
@@ -232,24 +296,65 @@ async def get_released_data(pool: asyncpg.pool.Pool, *,
         params.append(offset)
         rows = await conn.fetch(
             f"SELECT id, batch_no, device_id, accept_seq, median_nm, decided_at "
-            f"FROM batches{where_sql} ORDER BY id "
+            f"FROM batches{where_sql} ORDER BY decided_at, id "
             f"LIMIT ${len(params) - 1} OFFSET ${len(params)}",
             *params,
         )
-        out: List[Dict[str, Any]] = []
-        for r in rows:
-            wafers = await conn.fetch(
-                "SELECT wafer_no, thickness_nm FROM wafer_measurements "
-                "WHERE batch_id=$1 ORDER BY wafer_no", r["id"])
-            out.append({
-                "batch_no": r["batch_no"],
-                "device_id": r["device_id"],
-                "accept_seq": r["accept_seq"],
-                "median_nm": r["median_nm"],
-                "decided_at": r["decided_at"].isoformat() if r["decided_at"] else None,
-                "wafers": [
-                    {"wafer_no": w["wafer_no"], "thickness_nm": w["thickness_nm"]}
-                    for w in wafers
-                ],
-            })
-        return total, out
+        items = [await _serialize_batch(conn, r) for r in rows]
+
+    next_cursor = None
+    if rows:
+        last = rows[-1]
+        next_cursor = ReleaseCursor(
+            decided_at=last["decided_at"], batch_id=last["id"]).encode()
+    return ReleasedPage(total=total, items=items,
+                        next_cursor=next_cursor,
+                        has_more=offset + len(rows) < total)
+
+
+async def _get_released_cursor_page(pool, *, device_id, batch_no,
+                                    limit, cursor_token) -> ReleasedPage:
+    """Keyset pagination over the immutable release position."""
+    cursor = decode_cursor(cursor_token)  # CursorError -> HTTP 400 at the route
+
+    where, params = _released_filters(device_id, batch_no)
+    # Exclusive lower bound on the composite key (row-value comparison).
+    params.append(cursor.decided_at)
+    ts_pos = len(params)
+    params.append(cursor.batch_id)
+    id_pos = len(params)
+    where.append(f"(decided_at, id) > (${ts_pos}, ${id_pos})")
+    where_sql = " WHERE " + " AND ".join(where)
+
+    # Fetch one extra row to decide whether another page exists without a
+    # second round-trip; the extra row itself defines the next cursor.
+    params.append(limit + 1)
+    limit_pos = len(params)
+
+    async with pool.acquire() as conn:
+        # Total follows the same filters as the page (legacy contract).
+        count_where, count_params = _released_filters(device_id, batch_no)
+        total = await conn.fetchval(
+            "SELECT count(*) FROM batches WHERE "
+            + " AND ".join(count_where),
+            *count_params,
+        )
+        rows = await conn.fetch(
+            f"SELECT id, batch_no, device_id, accept_seq, median_nm, decided_at "
+            f"FROM batches{where_sql} ORDER BY decided_at, id "
+            f"LIMIT ${limit_pos}",
+            *params,
+        )
+        page_rows = rows[:limit]
+        items = [await _serialize_batch(conn, r) for r in page_rows]
+
+    if rows:
+        last = page_rows[-1]
+        next_cursor = ReleaseCursor(
+            decided_at=last["decided_at"], batch_id=last["id"]).encode()
+    else:
+        # Empty page: hand the same position back so the caller can keep
+        # polling; future releases land strictly above it.
+        next_cursor = cursor_token
+    return ReleasedPage(total=total, items=items, next_cursor=next_cursor,
+                        has_more=len(rows) > limit)

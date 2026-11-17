@@ -103,5 +103,28 @@ curl -sS "$BASE/batches/CRASH-4" | j
 
 echo; echo "== 6. data lake endpoint hides quarantined batches =="
 curl -sS "$BASE/data/released?device_id=$DEV" | j | grep -E 'total_released|batch_no'
+
+echo; echo "== 7. continuation cursor: walk every page via next_cursor =="
+cursor=""
+walked=""
+for _ in $(seq 1 50); do
+  if [ -z "$cursor" ]; then
+    page=$(curl -sS "$BASE/data/released?device_id=$DEV&limit=1")
+  else
+    page=$(curl -sS "$BASE/data/released?device_id=$DEV&limit=1&cursor=$cursor")
+  fi
+  walked="$walked $(echo "$page" | python3 -c 'import sys,json;print(" ".join(i["batch_no"] for i in json.load(sys.stdin)["items"]))')"
+  has_more=$(echo "$page" | python3 -c 'import sys,json;print(json.load(sys.stdin)["has_more"])')
+  [ "$has_more" = "True" ] || break
+  cursor=$(echo "$page" | python3 -c 'import sys,json;print(json.load(sys.stdin)["next_cursor"])')
+done
+echo "  cursor walk order:$walked"
+echo "  (quarantined DEMO-Q absent; every released batch appears exactly once)"
+# An end-of-stream cursor stays valid: empty page now, new releases later.
+end_cursor="$cursor"
+curl -sS "$BASE/data/released?limit=1&cursor=$end_cursor" \
+  | python3 -c 'import sys,json;d=json.load(sys.stdin);print("  empty page keeps cursor:", d["items"]==[] and d["next_cursor"]=="'"$end_cursor"'")'
+# Malformed cursor is a clean 400.
+echo "  malformed cursor http status: $(curl -sS -o /dev/null -w '%{http_code}' "$BASE/data/released?cursor=garbage")"
 echo
 echo "OpenAPI docs: $BASE/docs"

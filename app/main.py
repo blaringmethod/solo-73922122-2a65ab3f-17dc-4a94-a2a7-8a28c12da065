@@ -14,6 +14,7 @@ from fastapi.responses import JSONResponse
 
 from .config import settings
 from .csvutil import CsvValidationError, parse_thickness_csv
+from .cursor import CursorError
 from .db import close_pool, create_pool
 from .service import (
     ConflictError,
@@ -70,6 +71,11 @@ async def _conflict_handler(_request, exc: ConflictError):
         status_code=409,
         content={"error": str(exc), "existing": exc.existing},
     )
+
+
+@app.exception_handler(CursorError)
+async def _cursor_error_handler(_request, exc: CursorError):
+    return JSONResponse(status_code=400, content={"error": str(exc)})
 
 
 @app.get("/health")
@@ -139,15 +145,37 @@ async def device_batches(device_id: str):
 
 @app.get("/data/released", summary="数据湖供数接口（仅放行明细，隔离批不可见）")
 async def released_data(
-    device_id: Optional[str] = Query(None),
-    batch_no: Optional[str] = Query(None),
-    limit: int = Query(100, ge=1, le=1000),
-    offset: int = Query(0, ge=0),
+    device_id: Optional[str] = Query(None, description="按设备号过滤"),
+    batch_no: Optional[str] = Query(None, description="按批号过滤"),
+    limit: int = Query(100, ge=1, le=1000, description="单页批数上限"),
+    offset: int = Query(0, ge=0, description="偏移量（仅无 cursor 的传统分页使用）"),
+    cursor: Optional[str] = Query(
+        None,
+        description="续读游标（上一页返回的 next_cursor）；提供后忽略 offset，"
+                    "按不可变放行位置 (decided_at,id) 续读，漏放/重复安全",
+    ),
 ):
-    total, items = await get_released_data(
+    """数据湖持续取数。
+
+    持续接入请始终以上一页返回的 ``next_cursor`` 续读：
+
+    * 放行按判定时刻排序，早受理但晚判定的批不会被 offset 漂移漏掉，也不会重复；
+    * 空页返回同一个游标，稍后继续轮询即可发现新放行批；
+    * 游标仅由行值编码、无实例本地状态，实例重启或换一台实例后仍然有效；
+    * 重试同一游标得到同一页，已返回批的顺序保持稳定。
+    """
+    page = await get_released_data(
         get_pool_safe(), device_id=device_id, batch_no=batch_no,
-        limit=limit, offset=offset)
-    return {"total_released": total, "limit": limit, "offset": offset, "items": items}
+        limit=limit, offset=offset, cursor=cursor)
+    return {
+        "total_released": page.total,
+        "limit": limit,
+        "offset": offset if cursor is None else None,
+        "cursor": cursor,
+        "next_cursor": page.next_cursor,
+        "has_more": page.has_more,
+        "items": page.items,
+    }
 
 
 def get_pool_safe():

@@ -27,6 +27,38 @@
 | 实例退出后存活实例接续 | 判定在**单事务**内完成；进程崩溃则事务回滚，批次保持 PENDING、`device_state` 不变，咨询锁随会话自动释放，存活实例下轮 poll（0.25s）接续 |
 | 不重复推进参考、无半批 | 事务内 `SELECT ... FOR UPDATE` 锁 `device_state` 与批次行，决策字段与 `ref_batch_ids` 同事务提交；FIFO 序号断言 `accept_seq = last_decided_seq + 1` |
 | 供数只给放行明细 | `/data/released` SQL 固定 `status='RELEASED'`，隔离批任何过滤条件都查不到 |
+| 持续取数不漏批/不重复 | 供数接口返回**续读游标** `next_cursor`，按不可变放行位置 `(decided_at, id)` keyset 翻页；晚判定的早受理批仍会被取到，按返回游标前进既不跳过也不重复（见下“续读游标”） |
+
+## 续读游标（数据湖持续取数）
+
+放行顺序是**判定顺序而非受理顺序**：设备 A 的早受理批可能被同设备慢批压在
+PENDING，设备 B 的后受理批先放行。传统 `OFFSET` 基于变化中的结果集，一旦 A 随后
+放行并插到队首，下一页就会整体错位——重复 B、漏掉 A。
+
+`GET /data/released` 因此同时支持两种分页（过滤条件 `device_id`、`batch_no` 与
+单页 `limit` 两种模式完全一致）：
+
+* **游标模式（持续接入推荐）**：首次不带 `cursor`，之后每页带上一页返回的
+  `next_cursor`。服务端以 `(decided_at, id)` 做严格大于的 keyset 扫描：
+  - `decided_at` 在判定事务内以 `clock_timestamp()` 落定，`id` 为身份主键，二者
+    放行后永不变更，游标只编码这两个行值，是自包含的不透明 token；
+  - **重试同游标得到同一页、顺序稳定**；
+  - **空页返回同一个游标**，继续轮询即可发现之后新放行的批；
+  - 游标不含任何实例本地状态，**实例退出/重启或换到另一台实例后续读仍有效**；
+  - 非法游标返回 `400`。
+* **OFFSET 模式（保留，适合一次性单页快照查询）**：不带 `cursor` 时行为与旧版
+  一致；响应里同样附 `next_cursor`，可随时切换到游标模式。携带 `cursor` 时
+  `offset` 被忽略并在响应中回显为 `null`。
+
+响应字段：`total_released`（当前过滤条件下放行批总数）、`limit`、`offset`、
+`cursor`（本次入参）、`next_cursor`（下一页游标）、`has_more`、`items`。
+
+```bash
+# 第一页
+curl "$BASE/data/released?limit=100"
+# 续读：原样回传 next_cursor，直到 has_more=false；空页也继续轮询该游标
+curl "$BASE/data/released?limit=100&cursor=<上一页 next_cursor>"
+```
 
 ## 目录结构
 
@@ -36,15 +68,17 @@ app/
   schema.py     PostgreSQL 表结构
   db.py         asyncpg 连接池 + jsonb codec
   csvutil.py    严格 CSV 解析（1~1000片、片号批内唯一、厚度正整数）
+  cursor.py     供数续读游标的版本化编解码（(decided_at,id) 不透明 token）
   storage.py    原件内容寻址持久化（tmp+fsync+原子rename）
-  service.py    受理（幂等/冲突）、查询、供数读模型
+  service.py    受理（幂等/冲突）、查询、供数读模型（offset + 游标 keyset 分页）
   worker.py     后台判定 worker（设备咨询锁 + 单事务原子判定）
   main.py       FastAPI 路由、生命周期（每实例启动一个 worker）
 scripts/
   worker_harness.py  单实例 worker 驱动（提交/慢批/崩溃标记/空闲退出）
   demo_local.py      本地双实例端到端演示（便携 Postgres）
   demo_compose.sh    Docker Compose 栈演示
-tests/          pytest：CSV、API 规则、双 worker 并发、崩溃恢复（23 个）
+  smoke_cursor.py    双实例 HTTP 续读游标冒烟（慢批交错/空页轮询/跨实例游标）
+tests/          pytest：CSV、API 规则、双 worker 并发、崩溃恢复、续读游标（43 个）
 deploy/nginx/   双实例轮询负载均衡
 docker-compose.yml  db + api1 + api2 + nginx
 ```
@@ -80,7 +114,7 @@ python -m scripts.demo_local     # 慢批 + 崩溃接续完整演示
 | `POST /batches` | multipart：`batch_no`、`device_id`、`file`(CSV)；成功 `202`，校验失败 `400`，冲突 `409` |
 | `GET /batches/{batch_no}` | 判定结果、中位数、偏差、参考批号、原件路径、尝试次数、决定实例 |
 | `GET /devices/{device_id}/batches` | 按设备列受理顺序与状态 |
-| `GET /data/released` | 供数接口，**仅放行**批的晶圆明细，支持 device/batch 过滤与分页 |
+| `GET /data/released` | 供数接口，**仅放行**批的晶圆明细，支持 device/batch 过滤；分页支持续读游标 `cursor`/`next_cursor`（推荐）与传统 `offset` |
 | `GET /health` | 存活与数据库连通性 |
 | `POST /internal/shutdown?token=` | 仅演示用；未设 `SHUTDOWN_TOKEN` 时返回 404，不出现在 OpenAPI |
 
@@ -97,12 +131,21 @@ W002,508
 ## 测试
 
 ```bash
-DATABASE_DSN=<postgres dsn> python -m pytest -q
+python -m pytest -q          # 未设 DATABASE_DSN 时会自动起一个一次性便携 PostgreSQL
 ```
-28 个用例覆盖：CSV 边界与非法输入、前三批基线、>5nm 隔离与临界 5nm 放行、
+43 个用例覆盖：CSV 边界与非法输入、前三批基线、>5nm 隔离与临界 5nm 放行、
 隔离批不进参考窗、滚动窗口滑动、幂等重试与 409 冲突、供数不可见隔离批、
 双 worker 同设备 FIFO 与跨设备并行、小连接池下高并发同设备受理无死锁（回归）、
-真实子进程硬退出后的接续与无半批。
+真实子进程硬退出后的接续与无半批，以及续读游标的完整交错场景——慢批压住设备 A
+时设备 B 先放行、按游标逐页取数不漏不重且顺序稳定、同游标重试确定、空页同游标
+轮询后发现新放行批、过滤条件、非法游标 400、独立连接池（模拟实例重启）后游标仍有效。
+
+针对真实 HTTP 双实例栈的冒烟（需先 `docker compose up`，或本地起两个 uvicorn）：
+
+```bash
+python -m scripts.smoke_cursor --base http://localhost:8080 \
+    --marker /data/raw/slow_batches.txt
+```
 
 ## 演示中的慢批/崩溃钩子（仅测试用途）
 

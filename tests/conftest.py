@@ -1,9 +1,9 @@
 """Pytest fixtures against a real PostgreSQL (embedded via pgserver locally).
 
-The DSN is taken from ``DATABASE_DSN`` when present, otherwise the
-session-scoped embedded cluster started by ``scripts/start_test_db.py`` is
-used.  Every test starts with empty tables; the marker files used by the
-slow/crash demonstrations are redirected into per-test temp directories.
+The suite provisions its own throw-away embedded cluster (pgserver) unless
+``DATABASE_DSN`` is already exported, in which case that database is used.
+Every test starts with empty tables; the marker files used by the slow/crash
+demonstrations are redirected into per-test temp directories.
 """
 from __future__ import annotations
 
@@ -12,12 +12,20 @@ import os
 import tempfile
 import time
 
+import pgserver
 import pytest
 import pytest_asyncio
 
-_DSN_FILE = "/tmp/pg_dsn.txt"
-if "DATABASE_DSN" not in os.environ and os.path.exists(_DSN_FILE):
-    os.environ["DATABASE_DSN"] = open(_DSN_FILE).read().strip()
+# A leftover worker from an interrupted run may keep polling another embedded
+# cluster (processes in another PID namespace cannot be signalled from here).
+# Unless the caller pinned a database explicitly, give the suite its own
+# throw-away cluster so stale workers connected elsewhere cannot interfere.
+if not os.environ.get("DATABASE_DSN"):
+    _TEST_PG_DIR = os.environ.get("FAB_TEST_PG_DIR") or tempfile.mkdtemp(
+        prefix="fabpg_test_")
+    _pg = pgserver.get_server(_TEST_PG_DIR, cleanup_mode=None)
+    os.environ["DATABASE_DSN"] = _pg.get_uri()
+    os.environ["FAB_TEST_PG_DIR"] = _TEST_PG_DIR
 
 os.environ.setdefault("STORAGE_DIR", tempfile.mkdtemp(prefix="fabraw_"))
 os.environ.setdefault("INSTANCE_ID", "pytest")

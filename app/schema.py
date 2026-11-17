@@ -51,6 +51,13 @@ CREATE INDEX IF NOT EXISTS idx_batches_status
     ON batches (status) WHERE status = 'PENDING';
 CREATE INDEX IF NOT EXISTS idx_wafers_batch ON wafer_measurements (batch_id);
 
+-- Data-lake read path: released batches are scanned in release order
+-- (decided_at, id).  The partial index covers only visible rows, so the
+-- keyset pagination of /data/released stays an index range scan even as the
+-- table of pending/quarantined batches grows.
+CREATE INDEX IF NOT EXISTS idx_batches_released_cursor
+    ON batches (decided_at, id) WHERE status = 'RELEASED';
+
 -- One row per device: the durable processing cursor (last accepted sequence
 -- that has been decided) and the FIFO list of released batch ids that form
 -- the rolling reference window (most recent last).
